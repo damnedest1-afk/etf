@@ -65,3 +65,30 @@ def enrich_returns(rows, limit=300):
             row["r1"], row["r3"], row["r6"], row["r12"] = ret(30), ret(91), ret(182), ret(365)
             n += 1
             time.sleep(0.05)
+        except Exception:
+            continue
+    print("수익률 상세 계산:", n, "종목")
+
+def upsert(rows):
+    url = os.environ.get("SUPABASE_URL"); key = os.environ.get("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        print("Supabase 시크릿 없음 → 저장 생략"); return
+    ep = url.rstrip("/") + "/rest/v1/etfs"
+    hd = {"apikey": key, "Authorization": "Bearer " + key,
+          "Content-Type": "application/json",
+          "Prefer": "resolution=merge-duplicates,return=minimal"}
+    for i in range(0, len(rows), 500):
+        chunk = rows[i:i+500]
+        body = json.dumps(chunk, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(ep, data=body, headers=hd, method="POST")
+        with urllib.request.urlopen(req, timeout=40) as r:
+            print("  업서트", i, "~", i+len(chunk), ":", r.status)
+
+def main():
+    rows = collect()
+    enrich_returns(rows, limit=300)
+    upsert(rows)
+    print("끝! 총", len(rows), "종목")
+
+if __name__ == "__main__":
+    main()
