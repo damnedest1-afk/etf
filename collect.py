@@ -1,97 +1,67 @@
 # -*- coding: utf-8 -*-
 import os, json, time, datetime as dt, urllib.request
-from pykrx import stock
 
-KST = dt.timezone(dt.timedelta(hours=9))
-def ymd(d): return d.strftime("%Y%m%d")
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+      "Referer": "https://finance.naver.com/sise/etf.naver"}
 
-def recent_bday():
-    d = dt.datetime.now(KST).date()
-    for i in range(0, 8):
-        day = ymd(d - dt.timedelta(days=i))
-        try:
-            df = stock.get_etf_ohlcv_by_ticker(day)
-            if df is not None and len(df) > 50:
-                return day, df
-        except Exception as e:
-            print("  ohlcv try", day, "fail:", e)
-        time.sleep(0.5)
-    raise RuntimeError("최근 거래일 데이터를 찾지 못함")
-
-def close_map(day):
+def get(url):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        raw = r.read()
     try:
-        df = stock.get_etf_ohlcv_by_ticker(day)
-        return {t: float(df.loc[t, "종가"]) for t in df.index}
-    except Exception as e:
-        print("  close_map", day, "fail:", e); return {}
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("euc-kr", "replace")
 
-def find_close_map(target_date):
-    for i in range(0, 6):
-        m = close_map(ymd(target_date - dt.timedelta(days=i)))
-        if m: return m
-    return {}
-
-def collect_krx():
-    day, base = recent_bday()
-    today = dt.datetime.strptime(day, "%Y%m%d").date()
-    print("기준 거래일:", day, "종목수:", len(base))
-    print("KRX 컬럼:", list(base.columns))
-    now_close = {t: float(base.loc[t, "종가"]) for t in base.index}
-    maps = {}
-    for key, days in {"r1":30, "r3":91, "r6":182, "r12":365}.items():
-        maps[key] = find_close_map(today - dt.timedelta(days=days)); time.sleep(0.3)
-    names = {}
-    try:
-        for t in stock.get_etf_ticker_list(day):
-            try: names[t] = stock.get_etf_ticker_name(t)
-            except Exception: pass
-    except Exception as e:
-        print("name fail:", e)
-    def col(t, *cands):
-        for c in cands:
-            if c in base.columns:
-                try: return float(base.loc[t, c])
-                except Exception: pass
-        return 0.0
+def collect():
+    url = ("https://finance.naver.com/api/sise/etfItemList.nhn"
+           "?etfType=0&targetColumn=market_sum&sortOrder=desc")
+    data = json.loads(get(url))
+    items = data["result"]["etfItemList"]
+    print("네이버 목록 수신:", len(items), "종목")
+    today = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).strftime("%Y%m%d")
     rows = []
-    for t in base.index:
-        nowc = now_close.get(t, 0.0)
-        def ret(key):
-            b = maps[key].get(t)
-            return round((nowc/b - 1)*100, 2) if (b and nowc) else None
-        nav_tot = col(t, "순자산총액", "시가총액")
+    for it in items:
+        code = str(it.get("itemcode", "")).strip()
+        name = str(it.get("itemname", "")).strip()
+        if not code or not name:
+            continue
+        r3 = it.get("threeMonthEarnRate")
         rows.append({
-            "code": t, "name": names.get(t, ""),
-            "aum": round(nav_tot/1e8) if nav_tot else 0,
-            "turn": round(col(t, "거래대금")/1e8),
-            "r1": ret("r1"), "r3": ret("r3"), "r6": ret("r6"), "r12": ret("r12"),
-            "nav": nowc, "updated": day,
+            "code": code, "name": name,
+            "aum": int(it.get("marketSum") or 0),
+            "turn": round((it.get("amonut") or 0) / 100),
+            "r3": round(float(r3), 2) if r3 not in (None, "") else None,
+            "r1": None, "r6": None, "r12": None,
+            "nav": float(it.get("nowVal") or 0),
+            "updated": today,
         })
-    return rows, day
+    return rows
 
-def upsert_supabase(rows):
-    url = os.environ.get("SUPABASE_URL"); key = os.environ.get("SUPABASE_SERVICE_KEY")
-    if not url or not key:
-        print("Supabase 시크릿 없음"); return
-    endpoint = url.rstrip("/") + "/rest/v1/etfs"
-    headers = {"apikey": key, "Authorization": "Bearer "+key,
-               "Content-Type": "application/json",
-               "Prefer": "resolution=merge-duplicates,return=minimal"}
-    for i in range(0, len(rows), 500):
-        chunk = rows[i:i+500]
-        data = json.dumps(chunk, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
+def enrich_returns(rows, limit=300):
+    end = dt.datetime.now().strftime("%Y%m%d")
+    start = (dt.datetime.now() - dt.timedelta(days=420)).strftime("%Y%m%d")
+    n = 0
+    for row in rows:
+        if limit and n >= limit:
+            break
+        code = row["code"]
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                print("  업서트", i, "~", i+len(chunk), ":", r.status)
-        except Exception as e:
-            print("  업서트 실패:", e); raise
-
-def main():
-    rows, day = collect_krx()
-    print("수집 완료:", len(rows), "종목")
-    upsert_supabase(rows)
-    print("끝!")
-
-if __name__ == "__main__":
-    main()
+            u = (f"https://fchart.stock.naver.com/siseJson.naver?symbol={code}"
+                 f"&requestType=1&startTime={start}&endTime={end}&timeframe=day")
+            arr = json.loads(get(u).replace("'", '"'))
+            pts = [(str(x[0]), float(x[4])) for x in arr[1:] if str(x[0]).isdigit()]
+            if len(pts) < 25:
+                continue
+            last = pts[-1][1]
+            def ret(days):
+                cut = (dt.datetime.now() - dt.timedelta(days=days)).strftime("%Y%m%d")
+                base = None
+                for d, c in pts:
+                    if d <= cut: base = c
+                    else: break
+                if base is None: base = pts[0][1]
+                return round((last/base - 1)*100, 2) if base else None
+            row["r1"], row["r3"], row["r6"], row["r12"] = ret(30), ret(91), ret(182), ret(365)
+            n += 1
+            time.sleep(0.05)
